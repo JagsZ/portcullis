@@ -1,0 +1,4 @@
+portcullis_report_*.txt
+security_audit_*.txt
+*.log
+.DS_Store

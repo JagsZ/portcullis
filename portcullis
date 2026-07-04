@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# portcullis — know which gate is open.
+# A personal system security self-audit for Linux + macOS.
+#
+# Audits the most common ways into a machine, prints + saves a report,
+# then interactively offers fixes: SAFE fixes apply on your yes; RISKY
+# ones (firewall / service / encryption changes) only PRINT the command
+# + a warning — you run those yourself. Nothing is changed without asking,
+# and it never auto-runs a fix that could lock you out.
+#
+# Usage:
+#   sudo bash portcullis            # full audit (recommended)
+#   bash portcullis                 # limited audit (no root)
+#   bash portcullis --report-only   # audit + report, never prompt
+#   bash portcullis --help | --version
+#
+# Exit codes: 0 = clean · 1 = findings need attention · 2 = usage error
+# License: MIT
+
+set -u
+VERSION="1.0.0"
+REPORT_ONLY=0
+
+usage() {
+  cat <<EOF
+portcullis $VERSION — know which gate is open.
+
+A personal security self-audit for Linux + macOS. It checks the most
+common ways into your machine, saves a report, and offers to fix issues
+(safe fixes on your confirmation; risky ones are printed, not auto-run).
+
+USAGE:
+  sudo bash portcullis           Full audit (recommended)
+  bash portcullis                Limited audit (some checks need root)
+  bash portcullis --report-only  Audit + report only, no prompts
+  bash portcullis -h|--help      Show this help
+  bash portcullis -V|--version   Show version
+
+CHECKS: firewall, exposed ports, disk encryption, SSH config,
+pending updates, SSH key permissions, startup items.
+
+EXIT CODES: 0 clean · 1 findings need attention · 2 usage error
+EOF
+}
+
+# ---- arg parse ----
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "portcullis $VERSION"; exit 0 ;;
+    --report-only) REPORT_ONLY=1 ;;
+    *) echo "Unknown option: $1" >&2; echo "Try --help" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ---------- pretty output ----------
+if [ -t 1 ]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; BOLD=$'\e[1m'; DIM=$'\e[2m'; N=$'\e[0m'
+else
+  R=""; G=""; Y=""; B=""; BOLD=""; DIM=""; N=""
+fi
+
+OS="$(uname -s)"
+IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
+REPORT="$HOME/portcullis_report_$(date +%Y%m%d_%H%M%S).txt"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+line() { printf '%s\n' "------------------------------------------------------------"; }
+
+declare -a F_SEV F_TITLE F_DETAIL F_FIXTYPE F_FIXCMD F_WARN
+add() {
+  F_SEV+=("$1"); F_TITLE+=("$2"); F_DETAIL+=("$3")
+  F_FIXTYPE+=("$4"); F_FIXCMD+=("$5"); F_WARN+=("$6")
+}
+sev_tag() {
+  case "$1" in
+    CRIT) printf '%s[CRITICAL]%s' "$R$BOLD" "$N" ;;
+    HIGH) printf '%s[HIGH]%s'     "$R" "$N" ;;
+    WARN) printf '%s[WARN]%s'     "$Y" "$N" ;;
+    OK)   printf '%s[ OK ]%s'     "$G" "$N" ;;
+    INFO) printf '%s[INFO]%s'     "$B" "$N" ;;
+  esac
+}
+
+echo "${BOLD}${B}=== Portcullis — know which gate is open ===${N}"
+echo "v$VERSION   OS: $OS   Root: $([ $IS_ROOT -eq 1 ] && echo yes || echo no)   $(date)"
+[ $IS_ROOT -eq 0 ] && echo "${Y}Tip: re-run with 'sudo' for the full set of checks.${N}"
+line
+
+# ================= CHECKS =================
+
+# --- 1. Firewall ---
+fw_ok=""
+if [ "$OS" = "Linux" ]; then
+  if have ufw; then
+    st="$(ufw status 2>/dev/null | head -1)"
+    if echo "$st" | grep -qi "Status: active"; then fw_ok=1
+    elif echo "$st" | grep -qi "Status: inactive"; then fw_ok=0
+    fi
+  elif have firewall-cmd; then
+    [ "$(firewall-cmd --state 2>/dev/null)" = "running" ] && fw_ok=1 || fw_ok=0
+  fi
+  if [ "$fw_ok" = "0" ]; then
+    add HIGH "Firewall is OFF (the walls are down)" "No host firewall is active — every listening service is reachable on any network you join." \
+      SHOW "sudo ufw default deny incoming && sudo ufw allow OpenSSH && sudo ufw enable" \
+      "This can drop existing connections. 'allow OpenSSH' keeps SSH open — adjust if you use a non-standard port."
+  elif [ "$fw_ok" = "1" ]; then
+    add OK "Firewall is ON" "Host firewall active." NONE "" ""
+  else
+    add INFO "Firewall state unknown" "Could not read firewall state (need sudo, or ufw/firewalld not installed)." NONE "" ""
+  fi
+elif [ "$OS" = "Darwin" ]; then
+  SFW="/usr/libexec/ApplicationFirewall/socketfilterfw"
+  if [ -x "$SFW" ]; then
+    if "$SFW" --getglobalstate 2>/dev/null | grep -qi "enabled"; then
+      add OK "Firewall is ON" "macOS Application Firewall enabled." NONE "" ""
+    else
+      add HIGH "Firewall is OFF (the walls are down)" "macOS Application Firewall is disabled." \
+        SHOW "sudo $SFW --setglobalstate on && sudo $SFW --setblockall on" \
+        "'block all incoming' may stop apps expecting inbound connections; drop --setblockall if that's a problem."
+    fi
+  fi
+fi
+
+# --- 2. Open / exposed listening ports ---
+risky_ports="22 23 3389 445 139 5900 3306 5432 27017 6379 9200"
+exposed=""
+if [ "$OS" = "Linux" ] && have ss; then
+  while read -r addr; do
+    a_ip="${addr%:*}"; a_port="${addr##*:}"
+    case " $risky_ports " in *" $a_port "*) ;; *) continue;; esac
+    case "$a_ip" in 127.0.0.1|::1|"[::1]"|localhost) continue;; esac
+    exposed="$exposed $a_port"
+  done < <(ss -H -tuln 2>/dev/null | awk '{print $5}')
+elif [ "$OS" = "Darwin" ] && have lsof; then
+  while read -r hostport; do
+    a_port="${hostport##*:}"; a_ip="${hostport%:*}"
+    case " $risky_ports " in *" $a_port "*) ;; *) continue;; esac
+    case "$a_ip" in 127.0.0.1|"[::1]"|localhost) continue;; esac
+    exposed="$exposed $a_port"
+  done < <(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $9}')
+fi
+exposed="$(echo "$exposed" | tr ' ' '\n' | sort -un | tr '\n' ' ' | sed 's/^ *//;s/ *$//')"
+if [ -n "$exposed" ]; then
+  add HIGH "Sensitive gates open beyond localhost" "Ports exposed: $exposed  (22=SSH 3389=RDP 445=SMB 3306/5432=DB). Bots scan for these constantly." \
+    SHOW "# See what owns them, then disable if unused:\n#  Linux:  sudo ss -tulpn\n#  macOS:  sudo lsof -nP -iTCP -sTCP:LISTEN\n# Disable a service:  sudo systemctl disable --now <service>\n# Bind dev servers to 127.0.0.1 (not 0.0.0.0); put SSH/RDP behind a VPN." \
+    "Don't disable something you rely on. Verify each port before acting."
+else
+  add OK "No sensitive gates exposed" "No high-risk ports listening on non-loopback addresses." NONE "" ""
+fi
+
+# --- 3. Disk encryption ---
+if [ "$OS" = "Linux" ]; then
+  if have lsblk && lsblk -o TYPE,FSTYPE 2>/dev/null | grep -qiE "crypt|crypto_LUKS"; then
+    add OK "Disk encryption present (vault sealed)" "LUKS/crypt volume detected." NONE "" ""
+  else
+    add HIGH "No disk encryption (vault unlocked)" "If the machine is lost/stolen, the disk can be read directly — login is bypassed." \
+      SHOW "# Full-disk encryption is best set at install time (LUKS).\n# For a new/extra disk: sudo cryptsetup luksFormat /dev/sdX  (ERASES data)" \
+      "LUKS on the root disk is non-trivial to add after install; back up first."
+  fi
+elif [ "$OS" = "Darwin" ]; then
+  if have fdesetup && fdesetup status 2>/dev/null | grep -qi "FileVault is On"; then
+    add OK "FileVault ON (vault sealed)" "Disk is encrypted." NONE "" ""
+  else
+    add HIGH "FileVault is OFF (vault unlocked)" "Disk is not encrypted — data readable if the Mac is lost/stolen." \
+      SHOW "sudo fdesetup enable" \
+      "Save the recovery key it prints. Initial encryption runs in the background."
+  fi
+fi
+
+# --- 4. SSH server config (credentials exposure) ---
+SSHD="/etc/ssh/sshd_config"
+if [ -r "$SSHD" ]; then
+  pw="$(grep -Ei '^[[:space:]]*PasswordAuthentication' "$SSHD" | awk '{print tolower($2)}' | tail -1)"
+  rl="$(grep -Ei '^[[:space:]]*PermitRootLogin' "$SSHD" | awk '{print tolower($2)}' | tail -1)"
+  if [ "$pw" = "yes" ]; then
+    add HIGH "SSH allows password login" "Password auth invites brute-force / credential-stuffing. Keys are far safer." \
+      SHOW "# In $SSHD set:  PasswordAuthentication no\n# Then:  sudo systemctl restart ssh   (or sshd)" \
+      "Set up an SSH key FIRST and test it, or you may lock yourself out."
+  fi
+  if [ "$rl" = "yes" ]; then
+    add HIGH "SSH permits root login" "Direct root login is a prime target." \
+      SHOW "# In $SSHD set:  PermitRootLogin no   then restart ssh" \
+      "Make sure a non-root sudo user works first."
+  fi
+elif [ -f "$SSHD" ]; then
+  add INFO "SSH config not readable" "Re-run with sudo to check sshd_config." NONE "" ""
+fi
+
+# --- 5. Pending updates ---
+if [ "$OS" = "Linux" ]; then
+  if have apt; then
+    n="$(apt list --upgradable 2>/dev/null | grep -c '/')"
+    if [ "${n:-0}" -gt 0 ]; then
+      add WARN "$n updates available" "Unpatched software = known, published holes." \
+        SHOW "sudo apt update && sudo apt upgrade" "Review before a big upgrade; a reboot may be needed."
+    else
+      add OK "System up to date (apt)" "No pending package updates found." NONE "" ""
+    fi
+  elif have dnf; then
+    if dnf -q check-update >/dev/null 2>&1; then
+      add OK "System up to date (dnf)" "No pending updates." NONE "" ""
+    else
+      add WARN "Updates available (dnf)" "Unpatched software is an easy door." SHOW "sudo dnf upgrade" ""
+    fi
+  fi
+elif [ "$OS" = "Darwin" ]; then
+  if have softwareupdate; then
+    if softwareupdate -l 2>&1 | grep -qiE "recommended|Label:"; then
+      add WARN "macOS/App updates available" "Unpatched software is an easy door." \
+        SHOW "softwareupdate -ia   # and update the App Store apps" ""
+    else
+      add OK "System up to date" "No recommended updates found." NONE "" ""
+    fi
+  fi
+fi
+
+# --- 6. SSH private key permissions (SAFE auto-fix) ---
+# Portable: BSD find (macOS) rejects -perm /077, so use stat per file.
+if [ -d "$HOME/.ssh" ]; then
+  badkeys=""
+  for k in "$HOME"/.ssh/id_*; do
+    [ -f "$k" ] || continue
+    case "$k" in *.pub) continue;; esac
+    if [ "$OS" = "Darwin" ]; then m="$(stat -f '%Lp' "$k" 2>/dev/null)"; else m="$(stat -c '%a' "$k" 2>/dev/null)"; fi
+    [ -n "$m" ] || continue
+    if [ "${m: -2}" != "00" ]; then badkeys="$badkeys \"$k\""; fi
+  done
+  badkeys="${badkeys# }"
+  if [ -n "$badkeys" ]; then
+    add WARN "SSH private keys are too readable" "These keys are group/other-readable (should be 600): $badkeys" \
+      AUTO "chmod 600 $badkeys" ""
+  fi
+fi
+
+# --- 7. Startup / login items (review only) ---
+items=""
+if [ "$OS" = "Linux" ]; then
+  [ -d "$HOME/.config/autostart" ] && items="$(ls -1 "$HOME/.config/autostart" 2>/dev/null)"
+elif [ "$OS" = "Darwin" ]; then
+  items="$(ls -1 "$HOME/Library/LaunchAgents" /Library/LaunchAgents 2>/dev/null)"
+fi
+if [ -n "$items" ]; then
+  add INFO "Review your startup items" "Auto-start entries found (infostealers hide here). Verify each is one you trust:\n$items" NONE "" ""
+fi
+
+# ================= REPORT =================
+{
+echo "Portcullis report — know which gate is open"
+echo "v$VERSION   OS: $OS   $(date)"
+line
+for i in "${!F_SEV[@]}"; do
+  printf "[%s] %s\n" "${F_SEV[$i]}" "${F_TITLE[$i]}"
+  printf "      %s\n" "${F_DETAIL[$i]//\\n/$'\n      '}"
+done
+} > "$REPORT"
+
+high=0; warn=0; ok=0
+echo
+echo "${BOLD}Findings${N}"; line
+for i in "${!F_SEV[@]}"; do
+  printf "%s  %s%s%s\n" "$(sev_tag "${F_SEV[$i]}")" "$BOLD" "${F_TITLE[$i]}" "$N"
+  printf "      %s%s%s\n" "$DIM" "${F_DETAIL[$i]//\\n/$'\n      '}" "$N"
+  case "${F_SEV[$i]}" in HIGH|CRIT) high=$((high+1));; WARN) warn=$((warn+1));; OK) ok=$((ok+1));; esac
+done
+line
+echo "Summary: ${R}${high} high${N}, ${Y}${warn} warn${N}, ${G}${ok} ok${N}"
+echo "Report saved to: ${BOLD}$REPORT${N}"
+
+RC=0; { [ "$high" -gt 0 ] || [ "$warn" -gt 0 ]; } && RC=1
+
+# count fixables
+fixables=0
+for i in "${!F_SEV[@]}"; do [ "${F_FIXTYPE[$i]}" != "NONE" ] && fixables=$((fixables+1)); done
+
+# ---- report-only: list suggested fixes, never prompt ----
+if [ "$REPORT_ONLY" -eq 1 ]; then
+  if [ "$fixables" -gt 0 ]; then
+    echo; echo "${BOLD}Suggested fixes${N} (review before running):"; line
+    for i in "${!F_SEV[@]}"; do
+      [ "${F_FIXTYPE[$i]}" = "NONE" ] && continue
+      printf "%s %s\n" "$(sev_tag "${F_SEV[$i]}")" "${BOLD}${F_TITLE[$i]}${N}"
+      [ -n "${F_WARN[$i]}" ] && printf "%s! %s%s\n" "$Y" "${F_WARN[$i]}" "$N"
+      printf "%s\n\n" "${F_FIXCMD[$i]//\\n/$'\n'}"
+    done
+  fi
+  exit $RC
+fi
+
+# ---- interactive remediation ----
+[ "$fixables" -eq 0 ] && { echo; echo "${G}No gates left open. Nice.${N}"; exit $RC; }
+
+echo
+read -r -p "Go through the ${fixables} fixable item(s) now? [y/N] " go
+case "$go" in y|Y) ;; *) echo "Skipped. Review $REPORT anytime."; exit $RC;; esac
+
+for i in "${!F_SEV[@]}"; do
+  ft="${F_FIXTYPE[$i]}"; [ "$ft" = "NONE" ] && continue
+  echo; line
+  printf "%s %s\n" "$(sev_tag "${F_SEV[$i]}")" "${BOLD}${F_TITLE[$i]}${N}"
+  [ -n "${F_WARN[$i]}" ] && printf "%s! %s%s\n" "$Y" "${F_WARN[$i]}" "$N"
+  printf "%sFix:%s\n%s\n" "$BOLD" "$N" "${F_FIXCMD[$i]//\\n/$'\n'}"
+  if [ "$ft" = "AUTO" ]; then
+    read -r -p "This is safe to apply automatically. Apply now? [y/N] " a
+    case "$a" in
+      y|Y) if eval "${F_FIXCMD[$i]}"; then echo "${G}Applied.${N}"; else echo "${R}Failed — apply manually.${N}"; fi ;;
+      *)   echo "Left unchanged." ;;
+    esac
+  else
+    echo "${DIM}(Not auto-run — copy/paste the command above once you've reviewed it.)${N}"
+  fi
+done
+echo; echo "${G}Done.${N} Full report: $REPORT"
+exit $RC
