@@ -1,5 +1,8 @@
 # 🏰 Portcullis
 
+[![ShellCheck](https://github.com/JagsZ/portcullis/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/JagsZ/portcullis/actions/workflows/shellcheck.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 **Know which gate is open.**
 
 Troy didn't fall to a siege — it fell to an open gate. In the AI era, the
@@ -12,6 +15,8 @@ report, then offers to fix issues. **Safe fixes apply on your confirmation;
 risky ones (firewall, service, or encryption changes) are only printed with a
 warning — never auto-run.** Nothing changes without your yes, and it never
 runs a fix that could lock you out.
+
+![Portcullis demo](demo.gif)
 
 ---
 
@@ -48,6 +53,7 @@ bash portcullis --report-only
 sudo bash portcullis           Full audit (recommended)
 bash portcullis                Limited audit (some checks need root)
 bash portcullis --report-only  Audit + report only, no prompts
+bash portcullis --fix-safe     Auto-apply ONLY safe fixes; print risky ones
 bash portcullis -h | --help    Show help
 bash portcullis -V | --version Show version
 ```

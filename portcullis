@@ -20,6 +20,7 @@
 set -u
 VERSION="1.0.0"
 REPORT_ONLY=0
+FIX_SAFE=0
 
 usage() {
   cat <<EOF
@@ -33,6 +34,7 @@ USAGE:
   sudo bash portcullis           Full audit (recommended)
   bash portcullis                Limited audit (some checks need root)
   bash portcullis --report-only  Audit + report only, no prompts
+  bash portcullis --fix-safe     Auto-apply ONLY safe fixes; print risky ones
   bash portcullis -h|--help      Show this help
   bash portcullis -V|--version   Show version
 
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]; do
     -h|--help) usage; exit 0 ;;
     -V|--version) echo "portcullis $VERSION"; exit 0 ;;
     --report-only) REPORT_ONLY=1 ;;
+    --fix-safe) FIX_SAFE=1 ;;
     *) echo "Unknown option: $1" >&2; echo "Try --help" >&2; exit 2 ;;
   esac
   shift
@@ -285,6 +288,25 @@ if [ "$REPORT_ONLY" -eq 1 ]; then
       printf "%s\n\n" "${F_FIXCMD[$i]//\\n/$'\n'}"
     done
   fi
+  exit $RC
+fi
+
+# ---- fix-safe: auto-apply ONLY safe fixes, print risky ones, no prompts ----
+if [ "$FIX_SAFE" -eq 1 ]; then
+  applied=0
+  for i in "${!F_SEV[@]}"; do
+    ft="${F_FIXTYPE[$i]}"; [ "$ft" = "NONE" ] && continue
+    echo; line
+    printf "%s %s\n" "$(sev_tag "${F_SEV[$i]}")" "${BOLD}${F_TITLE[$i]}${N}"
+    if [ "$ft" = "AUTO" ]; then
+      printf "%sApplying safe fix:%s %s\n" "$BOLD" "$N" "${F_FIXCMD[$i]}"
+      if eval "${F_FIXCMD[$i]}"; then echo "${G}Applied.${N}"; applied=$((applied+1)); else echo "${R}Failed — apply manually.${N}"; fi
+    else
+      [ -n "${F_WARN[$i]}" ] && printf "%s! %s%s\n" "$Y" "${F_WARN[$i]}" "$N"
+      printf "%sRisky — run yourself:%s\n%s\n" "$BOLD" "$N" "${F_FIXCMD[$i]//\\n/$'\n'}"
+    fi
+  done
+  echo; echo "${G}Applied $applied safe fix(es).${N} Risky items above are printed for you to run."
   exit $RC
 fi
 
